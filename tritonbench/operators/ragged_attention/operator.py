@@ -1,7 +1,10 @@
 import argparse
 import contextlib
 import dataclasses
+import importlib.util
 import os
+import sys
+import threading
 from typing import Any, Callable, List, Optional
 
 import torch
@@ -122,6 +125,7 @@ else:
 #   hstu_self_tlx_mha     - hammer-template TLX Blackwell self-attn (fwd+bwd)
 HAS_HSTU_SELF_ATTN = False
 HAS_HSTU_SELF_CLC = False
+HAS_HSTU_SELF_HYBRID = False
 try:
     import os as _os
     import sys as _sys
@@ -149,9 +153,52 @@ try:
             "dq_fp32",
             "dkdv_subtile",
         }.issubset(field.name for field in dataclasses.fields(HSTUAutoWSConfig))
+        HAS_HSTU_SELF_HYBRID = (
+            "tlx_bwd" in {field.name for field in dataclasses.fields(HSTUAutoWSConfig)}
+            and getattr(_hstu_self_tlx, "HSTU_SILU_BWD_API_VERSION", None) == 1
+            and _hstu_self_tlx.HAS_TLX
+        )
 except Exception:
     HAS_HSTU_SELF_ATTN = False
     HAS_HSTU_SELF_CLC = False
+    HAS_HSTU_SELF_HYBRID = False
+
+
+_HSTU_HYBRID_LOCK = threading.Lock()
+
+
+def _get_hstu_hybrid_module():
+    """Keep hybrid configuration/autotuners independent of the Hammer provider."""
+    name = "tritonbench._ragged_hstu_hybrid"
+    with _HSTU_HYBRID_LOCK:
+        if name not in sys.modules:
+            if not HAS_HSTU_SELF_HYBRID:
+                raise RuntimeError(
+                    "HSTU hybrid requires the updated Meta Triton tutorial"
+                )
+            spec = importlib.util.spec_from_file_location(
+                name, os.path.join(_hstu_self_dir, "triton_hstu_attention.py")
+            )
+            module = importlib.util.module_from_spec(spec)
+            # dataclasses and Triton inspect the module during execution.
+            sys.modules[name] = module
+            try:
+                spec.loader.exec_module(module)
+                module.configure_autows(
+                    module.HSTUAutoWSConfig(
+                        sp=True,
+                        dq_reduce=True,
+                        tlx_bwd=True,
+                        bwd_bm=32,
+                        bwd_bn=128,
+                        bwd_stages=3,
+                    )
+                )
+            except BaseException:
+                del sys.modules[name]
+                raise
+        return sys.modules[name]
+
 
 # gfx950 (MI350X) TLX HSTU self-attention, from the same tutorials directory.
 # Separate try block from the Blackwell import above so neither disables the
@@ -333,6 +380,47 @@ class Operator(BenchmarkOperator):
             sort_by_length=True,
             enable_tma=is_cuda(),
         )
+
+    @register_benchmark(enabled=HAS_HSTU_SELF_HYBRID and IS_BLACKWELL)
+    def hstu_triton_hybrid(
+        self, q, k, v, seq_offsets, num_targets, max_seq_len, sparsity
+    ):
+        _set_meta_ws(False)
+        module = _get_hstu_hybrid_module()
+        attn_scale = torch.tensor(
+            1.0 / max_seq_len, device=q.device, dtype=torch.float32
+        )
+
+        def launch():
+            return module.triton_hstu_mha(
+                max_seq_len=max_seq_len,
+                alpha=self.alpha,
+                q=q,
+                k=k,
+                v=v,
+                seq_offsets=seq_offsets,
+                attn_scale=attn_scale,
+                num_targets=num_targets,
+                max_attn_len=self.max_attn_len,
+                contextual_seq_len=self.contextual_seq_len,
+                sort_by_length=True,
+                enable_tma=True,
+            )
+
+        def run():
+            # Other providers may use warp specialization. Avoid its compiler
+            # mode leaking into this callback, without adding a scope when the
+            # ordinary mode is already active.
+            if (
+                triton.knobs.nvidia.use_meta_ws
+                or triton.knobs.nvidia.disable_wsbarrier_reorder
+            ):
+                with _compiler_mode(False):
+                    return launch()
+            return launch()
+
+        run._hstu_compiler_mode = (False, False)
+        return run
 
     @register_benchmark(enabled=HAS_HSTU_SELF_ATTN and IS_BLACKWELL)
     def hstu_tlx(self, q, k, v, seq_offsets, num_targets, max_seq_len, sparsity):
