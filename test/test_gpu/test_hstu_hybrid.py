@@ -57,7 +57,7 @@ def assert_l2(actual, expected):
     assert float(error) < 0.01, float(error)
 
 
-@pytest.mark.parametrize("dimension,value_dimension", [(64, 64), (64, 128), (32, 64)])
+@pytest.mark.parametrize("dimension,value_dimension", [(64, 64), (64, 128), (32, 64), (128, 128)])
 def test_hstu_hybrid_forward_gradients_and_hammer_isolation(dimension, value_dimension):
     # Removing the provider or sharing its configuration with Hammer must fail.
     assert callable(getattr(operator.Operator, "hstu_triton_hybrid", None))
